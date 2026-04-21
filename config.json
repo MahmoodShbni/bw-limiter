@@ -1,0 +1,2 @@
+{"name": "ali",  "listen": 9010, "target": "127.0.0.1:1080", "up": "30KB", "down": "300KB"}
+{"name": "ali2", "listen": 9011, "target": "127.0.0.1:1081", "up": "30KB", "down": "300KB"}
