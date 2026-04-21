@@ -1,0 +1,62 @@
+name: Build Linux AMD64
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Download dependencies
+        run: go mod tidy
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build (Linux AMD64, static)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o bwlimit-linux-amd64 \
+            main.go
+
+      - name: Verify binary
+        run: |
+          file bwlimit-linux-amd64
+          ls -lh bwlimit-linux-amd64
+          ./bwlimit-linux-amd64 -help || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bwlimit-linux-amd64
+          path: bwlimit-linux-amd64
+          retention-days: 30
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bwlimit-linux-amd64
+          generate_release_notes: true
