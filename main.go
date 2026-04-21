@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,33 +19,124 @@ import (
 )
 
 // ============================================================
-// Stats
+// Config
 // ============================================================
 
-type Stats struct {
-	uploadBytes   uint64 // bytes from client to server
-	downloadBytes uint64 // bytes from server to client
-	connections   int64  // active connections
-	totalConns    uint64 // total connections since start
+type ProxyConfig struct {
+	Name   string `json:"name"`
+	Listen int    `json:"listen"`
+	Target string `json:"target"`
+	Up     string `json:"up"`
+	Down   string `json:"down"`
+	Burst  string `json:"burst,omitempty"` // optional, default 32KB
 }
 
-var stats = &Stats{}
+// loadConfigs reads a JSONL file (one JSON object per line).
+// Empty lines and lines starting with # are ignored.
+func loadConfigs(path string) ([]ProxyConfig, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open config: %w", err)
+	}
+	defer f.Close()
+
+	var configs []ProxyConfig
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
+			continue
+		}
+
+		var cfg ProxyConfig
+		if err := json.Unmarshal([]byte(line), &cfg); err != nil {
+			return nil, fmt.Errorf("line %d: invalid JSON: %w", lineNum, err)
+		}
+
+		if err := validateConfig(&cfg, lineNum); err != nil {
+			return nil, err
+		}
+
+		configs = append(configs, cfg)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+
+	if len(configs) == 0 {
+		return nil, fmt.Errorf("no valid proxy entries found in %s", path)
+	}
+
+	return configs, nil
+}
+
+func validateConfig(cfg *ProxyConfig, lineNum int) error {
+	if cfg.Name == "" {
+		cfg.Name = fmt.Sprintf("proxy-%d", cfg.Listen)
+	}
+	if cfg.Listen <= 0 || cfg.Listen > 65535 {
+		return fmt.Errorf("line %d (%s): invalid listen port %d", lineNum, cfg.Name, cfg.Listen)
+	}
+	if cfg.Target == "" {
+		return fmt.Errorf("line %d (%s): target is required", lineNum, cfg.Name)
+	}
+	if cfg.Up == "" {
+		return fmt.Errorf("line %d (%s): up is required", lineNum, cfg.Name)
+	}
+	if cfg.Down == "" {
+		return fmt.Errorf("line %d (%s): down is required", lineNum, cfg.Name)
+	}
+	if cfg.Burst == "" {
+		cfg.Burst = "32KB"
+	}
+	return nil
+}
 
 // ============================================================
-// Rate Limited Reader - core logic
+// Stats (global, aggregated)
 // ============================================================
 
-// rateLimitedReader wraps an io.Reader and limits read throughput
+type ProxyStats struct {
+	Name          string
+	UploadBytes   uint64
+	DownloadBytes uint64
+	Connections   int64
+	TotalConns    uint64
+}
+
+var (
+	allStats   = make(map[string]*ProxyStats)
+	statsMutex sync.RWMutex
+)
+
+func getOrCreateStats(name string) *ProxyStats {
+	statsMutex.Lock()
+	defer statsMutex.Unlock()
+	s, ok := allStats[name]
+	if !ok {
+		s = &ProxyStats{Name: name}
+		allStats[name] = s
+	}
+	return s
+}
+
+// ============================================================
+// Rate Limited Reader
+// ============================================================
+
 type rateLimitedReader struct {
 	r       io.Reader
 	limiter *rate.Limiter
-	counter *uint64 // pointer to stats counter
+	counter *uint64
 	ctx     context.Context
 }
 
 func (rlr *rateLimitedReader) Read(p []byte) (int, error) {
-	// Cap each read to a small chunk for tighter rate control.
-	// Must be <= burst size or WaitN will fail.
 	const maxChunk = 4096
 	if len(p) > maxChunk {
 		p = p[:maxChunk]
@@ -51,9 +145,6 @@ func (rlr *rateLimitedReader) Read(p []byte) (int, error) {
 	n, err := rlr.r.Read(p)
 	if n > 0 {
 		atomic.AddUint64(rlr.counter, uint64(n))
-
-		// Block until the token bucket allows n bytes through.
-		// This is where the actual rate limiting happens.
 		if waitErr := rlr.limiter.WaitN(rlr.ctx, n); waitErr != nil {
 			return n, waitErr
 		}
@@ -66,32 +157,67 @@ func (rlr *rateLimitedReader) Read(p []byte) (int, error) {
 // ============================================================
 
 type Proxy struct {
+	name         string
 	listenPort   int
 	targetAddr   string
-	uploadRate   int // bytes per second - client to server
-	downloadRate int // bytes per second - server to client
-	burst        int // token bucket burst size
+	uploadRate   int
+	downloadRate int
+	burst        int
+	stats        *ProxyStats
 }
 
-func (p *Proxy) Start() error {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", p.listenPort))
+func NewProxy(cfg ProxyConfig) (*Proxy, error) {
+	uploadRate, err := parseRate(cfg.Up)
 	if err != nil {
-		return fmt.Errorf("failed to listen on port %d: %v", p.listenPort, err)
+		return nil, fmt.Errorf("%s: upload rate: %w", cfg.Name, err)
+	}
+	downloadRate, err := parseRate(cfg.Down)
+	if err != nil {
+		return nil, fmt.Errorf("%s: download rate: %w", cfg.Name, err)
+	}
+	burst, err := parseRate(cfg.Burst)
+	if err != nil {
+		return nil, fmt.Errorf("%s: burst: %w", cfg.Name, err)
+	}
+
+	return &Proxy{
+		name:         cfg.Name,
+		listenPort:   cfg.Listen,
+		targetAddr:   cfg.Target,
+		uploadRate:   uploadRate,
+		downloadRate: downloadRate,
+		burst:        burst,
+		stats:        getOrCreateStats(cfg.Name),
+	}, nil
+}
+
+func (p *Proxy) Start(ctx context.Context) error {
+	lc := net.ListenConfig{}
+	listener, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", p.listenPort))
+	if err != nil {
+		return fmt.Errorf("[%s] listen :%d: %w", p.name, p.listenPort, err)
 	}
 	defer listener.Close()
 
-	log.Printf("proxy started on port %d", p.listenPort)
-	log.Printf("target: %s", p.targetAddr)
-	log.Printf("upload limit:   %s/s", humanizeBytes(p.uploadRate))
-	log.Printf("download limit: %s/s", humanizeBytes(p.downloadRate))
+	log.Printf("[%s] listening on :%d -> %s (up: %s/s, down: %s/s)",
+		p.name, p.listenPort, p.targetAddr,
+		humanizeBytes(p.uploadRate), humanizeBytes(p.downloadRate))
+
+	// Close listener when context is done.
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
 
 	for {
 		clientConn, err := listener.Accept()
 		if err != nil {
-			log.Printf("accept error: %v", err)
+			if ctx.Err() != nil {
+				return nil
+			}
+			log.Printf("[%s] accept error: %v", p.name, err)
 			continue
 		}
-
 		go p.handleConnection(clientConn)
 	}
 }
@@ -99,21 +225,19 @@ func (p *Proxy) Start() error {
 func (p *Proxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	atomic.AddInt64(&stats.connections, 1)
-	atomic.AddUint64(&stats.totalConns, 1)
-	defer atomic.AddInt64(&stats.connections, -1)
+	atomic.AddInt64(&p.stats.Connections, 1)
+	atomic.AddUint64(&p.stats.TotalConns, 1)
+	defer atomic.AddInt64(&p.stats.Connections, -1)
 
 	clientAddr := clientConn.RemoteAddr().String()
-	log.Printf("new connection from %s", clientAddr)
 
 	targetConn, err := net.DialTimeout("tcp", p.targetAddr, 10*time.Second)
 	if err != nil {
-		log.Printf("failed to dial target %s: %v", p.targetAddr, err)
+		log.Printf("[%s] dial %s: %v", p.name, p.targetAddr, err)
 		return
 	}
 	defer targetConn.Close()
 
-	// Per-connection limiters so each client gets its own budget.
 	uploadLimiter := rate.NewLimiter(rate.Limit(p.uploadRate), p.burst)
 	downloadLimiter := rate.NewLimiter(rate.Limit(p.downloadRate), p.burst)
 
@@ -131,11 +255,10 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 				tc.CloseWrite()
 			}
 		}()
-
 		limited := &rateLimitedReader{
 			r:       clientConn,
 			limiter: uploadLimiter,
-			counter: &stats.uploadBytes,
+			counter: &p.stats.UploadBytes,
 			ctx:     ctx,
 		}
 		io.Copy(targetConn, limited)
@@ -149,55 +272,70 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 				tc.CloseWrite()
 			}
 		}()
-
 		limited := &rateLimitedReader{
 			r:       targetConn,
 			limiter: downloadLimiter,
-			counter: &stats.downloadBytes,
+			counter: &p.stats.DownloadBytes,
 			ctx:     ctx,
 		}
 		io.Copy(clientConn, limited)
 	}()
 
 	wg.Wait()
-	log.Printf("connection %s closed", clientAddr)
+	_ = clientAddr
 }
 
 // ============================================================
 // Stats printer
 // ============================================================
 
-func printStats() {
-	ticker := time.NewTicker(5 * time.Second)
+func printStats(interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	var lastUpload, lastDownload uint64
+	type snapshot struct {
+		upload, download uint64
+	}
+	last := make(map[string]snapshot)
 	lastTime := time.Now()
 
 	for range ticker.C {
 		now := time.Now()
 		elapsed := now.Sub(lastTime).Seconds()
-
-		currentUpload := atomic.LoadUint64(&stats.uploadBytes)
-		currentDownload := atomic.LoadUint64(&stats.downloadBytes)
-		currentConns := atomic.LoadInt64(&stats.connections)
-		totalConns := atomic.LoadUint64(&stats.totalConns)
-
-		uploadRate := float64(currentUpload-lastUpload) / elapsed
-		downloadRate := float64(currentDownload-lastDownload) / elapsed
-
-		log.Printf("stats | conns: %d active / %d total | up: %s/s | down: %s/s | total up: %s down: %s",
-			currentConns,
-			totalConns,
-			humanizeBytes(int(uploadRate)),
-			humanizeBytes(int(downloadRate)),
-			humanizeBytes(int(currentUpload)),
-			humanizeBytes(int(currentDownload)),
-		)
-
-		lastUpload = currentUpload
-		lastDownload = currentDownload
 		lastTime = now
+
+		statsMutex.RLock()
+		names := make([]string, 0, len(allStats))
+		for name := range allStats {
+			names = append(names, name)
+		}
+		statsMutex.RUnlock()
+
+		log.Printf("------ stats ------")
+		for _, name := range names {
+			statsMutex.RLock()
+			s := allStats[name]
+			statsMutex.RUnlock()
+
+			up := atomic.LoadUint64(&s.UploadBytes)
+			down := atomic.LoadUint64(&s.DownloadBytes)
+			conns := atomic.LoadInt64(&s.Connections)
+			total := atomic.LoadUint64(&s.TotalConns)
+
+			prev := last[name]
+			upRate := float64(up-prev.upload) / elapsed
+			downRate := float64(down-prev.download) / elapsed
+
+			log.Printf("[%s] conns: %d/%d | up: %s/s | down: %s/s | total: up=%s down=%s",
+				name, conns, total,
+				humanizeBytes(int(upRate)),
+				humanizeBytes(int(downRate)),
+				humanizeBytes(int(up)),
+				humanizeBytes(int(down)),
+			)
+
+			last[name] = snapshot{upload: up, download: down}
+		}
 	}
 }
 
@@ -218,7 +356,6 @@ func humanizeBytes(b int) string {
 	return fmt.Sprintf("%.2f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-// parseRate parses a string like "30KB" or "1MB" into bytes/second.
 func parseRate(s string) (int, error) {
 	s = strings.TrimSpace(strings.ToUpper(s))
 	multiplier := 1
@@ -229,13 +366,16 @@ func parseRate(s string) (int, error) {
 	case strings.HasSuffix(s, "MB"):
 		multiplier = 1024 * 1024
 		s = strings.TrimSuffix(s, "MB")
+	case strings.HasSuffix(s, "GB"):
+		multiplier = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "GB")
 	case strings.HasSuffix(s, "B"):
 		s = strings.TrimSuffix(s, "B")
 	}
 
 	var value int
-	if _, err := fmt.Sscanf(s, "%d", &value); err != nil {
-		return 0, fmt.Errorf("invalid rate format: %s (example: 30KB, 1MB)", s)
+	if _, err := fmt.Sscanf(strings.TrimSpace(s), "%d", &value); err != nil {
+		return 0, fmt.Errorf("invalid rate format: %q (example: 30KB, 1MB)", s)
 	}
 	return value * multiplier, nil
 }
@@ -246,34 +386,47 @@ func parseRate(s string) (int, error) {
 
 func main() {
 	var (
-		listenPort  = flag.Int("listen", 8080, "local port to listen on")
-		target      = flag.String("target", "127.0.0.1:80", "target address (host:port)")
-		uploadStr   = flag.String("up", "30KB", "upload rate limit (e.g. 30KB, 1MB)")
-		downloadStr = flag.String("down", "300KB", "download rate limit (e.g. 300KB, 2MB)")
-		burstKB     = flag.Int("burst", 32, "token bucket burst size in KB")
+		configPath    = flag.String("config", "config.json", "path to JSONL config file")
+		statsInterval = flag.Duration("stats-interval", 5*time.Second, "stats print interval")
 	)
 	flag.Parse()
 
-	uploadRate, err := parseRate(*uploadStr)
+	configs, err := loadConfigs(*configPath)
 	if err != nil {
-		log.Fatalf("upload: %v", err)
-	}
-	downloadRate, err := parseRate(*downloadStr)
-	if err != nil {
-		log.Fatalf("download: %v", err)
+		log.Fatalf("load config: %v", err)
 	}
 
-	proxy := &Proxy{
-		listenPort:   *listenPort,
-		targetAddr:   *target,
-		uploadRate:   uploadRate,
-		downloadRate: downloadRate,
-		burst:        *burstKB * 1024,
+	log.Printf("loaded %d proxy entries from %s", len(configs), *configPath)
+
+	// Check for duplicate listen ports.
+	seen := make(map[int]string)
+	for _, c := range configs {
+		if prev, ok := seen[c.Listen]; ok {
+			log.Fatalf("duplicate listen port %d used by %q and %q", c.Listen, prev, c.Name)
+		}
+		seen[c.Listen] = c.Name
 	}
 
-	go printStats()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	if err := proxy.Start(); err != nil {
-		log.Fatal(err)
+	var wg sync.WaitGroup
+	for _, cfg := range configs {
+		p, err := NewProxy(cfg)
+		if err != nil {
+			log.Fatalf("create proxy: %v", err)
+		}
+
+		wg.Add(1)
+		go func(proxy *Proxy) {
+			defer wg.Done()
+			if err := proxy.Start(ctx); err != nil {
+				log.Printf("[%s] stopped: %v", proxy.name, err)
+			}
+		}(p)
 	}
+
+	go printStats(*statsInterval)
+
+	wg.Wait()
 }
