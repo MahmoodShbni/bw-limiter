@@ -6,21 +6,17 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
 )
 
-// ============================================================
-// Config
-// ============================================================
+// ================= CONFIG =================
 
 type ProxyConfig struct {
 	Name   string `json:"name"`
@@ -28,78 +24,6 @@ type ProxyConfig struct {
 	Target string `json:"target"`
 	Up     string `json:"up"`
 	Down   string `json:"down"`
-	Burst  string `json:"burst,omitempty"`
-}
-
-func loadConfigs(path string) ([]ProxyConfig, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	var cfgs []ProxyConfig
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
-
-	lineNum := 0
-	for sc.Scan() {
-		lineNum++
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		var c ProxyConfig
-		if err := json.Unmarshal([]byte(line), &c); err != nil {
-			return nil, fmt.Errorf("line %d: %v", lineNum, err)
-		}
-		cfgs = append(cfgs, c)
-	}
-	return cfgs, sc.Err()
-}
-
-// ============================================================
-// Stats
-// ============================================================
-
-type Stats struct {
-	Name          string
-	Up            uint64
-	Down          uint64
-	Conn          int64
-	TotalConn     uint64
-}
-
-var (
-	statsMap = make(map[string]*Stats)
-	mu       sync.Mutex
-)
-
-func getStats(name string) *Stats {
-	mu.Lock()
-	defer mu.Unlock()
-
-	if s, ok := statsMap[name]; ok {
-		return s
-	}
-	s := &Stats{Name: name}
-	statsMap[name] = s
-	return s
-}
-
-// ============================================================
-// Proxy
-// ============================================================
-
-type Proxy struct {
-	name     string
-	listen   int
-	target   string
-	stats    *Stats
-
-	upLimiter   *rate.Limiter
-	downLimiter *rate.Limiter
 }
 
 func parseRate(s string) int {
@@ -120,190 +44,169 @@ func parseRate(s string) int {
 	return v * m
 }
 
-func NewProxy(c ProxyConfig) *Proxy {
-	up := parseRate(c.Up)
-	down := parseRate(c.Down)
-
-	// 🔥 مهم: burst خیلی کوچک برای جلوگیری از spike
-	burst := 4 * 1024
-
-	return &Proxy{
-		name:   c.Name,
-		listen: c.Listen,
-		target: c.Target,
-		stats:  getStats(c.Name),
-
-		upLimiter:   rate.NewLimiter(rate.Limit(up), burst),
-		downLimiter: rate.NewLimiter(rate.Limit(down), burst),
-	}
-}
-
-// ============================================================
-// RATE LIMITED READER (FIX اصلی)
-// ============================================================
-
-const chunkSize = 4 * 1024
-
-type rlReader struct {
-	r       io.Reader
-	limiter *rate.Limiter
-	counter *uint64
-	ctx     context.Context
-}
-
-func (r *rlReader) Read(p []byte) (int, error) {
-
-	if len(p) > chunkSize {
-		p = p[:chunkSize]
-	}
-
-	// ✅ مهم‌ترین تغییر: قبل از read throttle
-	if err := r.limiter.WaitN(r.ctx, len(p)); err != nil {
-		return 0, err
-	}
-
-	n, err := r.r.Read(p)
-	if n > 0 {
-		atomic.AddUint64(r.counter, uint64(n))
-	}
-	return n, err
-}
-
-// ============================================================
-// Handler
-// ============================================================
-
-func (p *Proxy) handle(c net.Conn) {
-	defer c.Close()
-
-	atomic.AddInt64(&p.stats.Conn, 1)
-	atomic.AddUint64(&p.stats.TotalConn, 1)
-	defer atomic.AddInt64(&p.stats.Conn, -1)
-
-	t, err := net.DialTimeout("tcp", p.target, 10*time.Second)
+func load(path string) ([]ProxyConfig, error) {
+	f, err := os.Open(path)
 	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var out []ProxyConfig
+	sc := bufio.NewScanner(f)
+
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		var c ProxyConfig
+		if err := json.Unmarshal([]byte(line), &c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, sc.Err()
+}
+
+// ================= PROXY =================
+
+type Proxy struct {
+	name   string
+	listen int
+	target string
+
+	upRate   int
+	downRate int
+
+	upBytes   uint64
+	downBytes uint64
+	connCount int64
+}
+
+func NewProxy(c ProxyConfig) *Proxy {
+	return &Proxy{
+		name:     c.Name,
+		listen:   c.Listen,
+		target:   c.Target,
+		upRate:   parseRate(c.Up),
+		downRate: parseRate(c.Down),
+	}
+}
+
+// ================= CORE STREAM =================
+
+func pipe(ctx context.Context, src net.Conn, dst net.Conn, limiter *rate.Limiter, counter *uint64) {
+	defer src.Close()
+	defer dst.Close()
+
+	buf := make([]byte, 4*1024)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// read
+		n, err := src.Read(buf)
+		if n > 0 {
+
+			// 🔥 pacing BEFORE write (fix collapse)
+			if limiter != nil {
+				if err := limiter.WaitN(ctx, n); err != nil {
+					return
+				}
+			}
+
+			written := 0
+			for written < n {
+				w, err := dst.Write(buf[written:n])
+				if err != nil {
+					return
+				}
+				written += w
+			}
+
+			atomic.AddUint64(counter, uint64(n))
+		}
+
+		if err != nil {
+			return
+		}
+	}
+}
+
+// ================= HANDLER =================
+
+func (p *Proxy) handle(client net.Conn) {
+	atomic.AddInt64(&p.connCount, 1)
+	defer atomic.AddInt64(&p.connCount, -1)
+
+	target, err := net.DialTimeout("tcp", p.target, 10*time.Second)
+	if err != nil {
+		client.Close()
 		return
 	}
-	defer t.Close()
 
-	// 🔥 مهم برای VLESS / TCP
-	_ = c.(*net.TCPConn).SetNoDelay(true)
-	_ = t.(*net.TCPConn).SetNoDelay(true)
+	// 🔥 IMPORTANT TCP tuning (fix IDM + VLESS jitter)
+	if c, ok := client.(*net.TCPConn); ok {
+		_ = c.SetNoDelay(true)
+		_ = c.SetReadBuffer(256 * 1024)
+		_ = c.SetWriteBuffer(256 * 1024)
+	}
+	if t, ok := target.(*net.TCPConn); ok {
+		_ = t.SetNoDelay(true)
+		_ = t.SetReadBuffer(256 * 1024)
+		_ = t.SetWriteBuffer(256 * 1024)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+	// 🔥 per-connection limiter (IMPORTANT FIX)
+	upLimiter := rate.NewLimiter(rate.Limit(p.upRate), 8*1024)
+	downLimiter := rate.NewLimiter(rate.Limit(p.downRate), 8*1024)
 
-	// client -> target
-	go func() {
-		defer wg.Done()
-		defer func() { if x, ok := t.(*net.TCPConn); ok { x.CloseWrite() } }()
-
-		io.Copy(t, &rlReader{
-			r:       c,
-			limiter: p.upLimiter,
-			counter: &p.stats.Up,
-			ctx:     ctx,
-		})
-	}()
-
-	// target -> client
-	go func() {
-		defer wg.Done()
-		defer func() { if x, ok := c.(*net.TCPConn); ok { x.CloseWrite() } }()
-
-		io.Copy(c, &rlReader{
-			r:       t,
-			limiter: p.downLimiter,
-			counter: &p.stats.Down,
-			ctx:     ctx,
-		})
-	}()
-
-	wg.Wait()
+	go pipe(ctx, client, target, upLimiter, &p.upBytes)
+	pipe(ctx, target, client, downLimiter, &p.downBytes)
 }
 
-// ============================================================
-// Start
-// ============================================================
+// ================= START =================
 
-func (p *Proxy) Start(ctx context.Context) error {
+func (p *Proxy) start() {
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", p.listen))
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
 	defer l.Close()
 
-	log.Printf("[%s] listening on %d -> %s", p.name, p.listen, p.target)
-
-	go func() {
-		<-ctx.Done()
-		l.Close()
-	}()
+	log.Printf("[%s] listening :%d -> %s", p.name, p.listen, p.target)
 
 	for {
 		c, err := l.Accept()
 		if err != nil {
-			return err
+			continue
 		}
 		go p.handle(c)
 	}
 }
 
-// ============================================================
-// Stats printer
-// ============================================================
-
-func statsLoop() {
-	t := time.NewTicker(5 * time.Second)
-	defer t.Stop()
-
-	var lastUp, lastDown uint64
-
-	for range t.C {
-		mu.Lock()
-		for _, s := range statsMap {
-			up := atomic.LoadUint64(&s.Up)
-			down := atomic.LoadUint64(&s.Down)
-
-			log.Printf("[%s] conn=%d up=%dKB down=%dKB",
-				s.Name,
-				atomic.LoadInt64(&s.Conn),
-				(up-lastUp)/1024,
-				(down-lastDown)/1024,
-			)
-
-			lastUp = up
-			lastDown = down
-		}
-		mu.Unlock()
-	}
-}
-
-// ============================================================
-// MAIN
-// ============================================================
+// ================= MAIN =================
 
 func main() {
-	configPath := flag.String("config", "config.json", "")
+	cfgPath := flag.String("config", "config.json", "")
 	flag.Parse()
 
-	cfgs, err := loadConfigs(*configPath)
+	cfgs, err := load(*cfgPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	for _, c := range cfgs {
 		p := NewProxy(c)
-		go p.Start(ctx)
+		go p.start()
 	}
-
-	go statsLoop()
 
 	select {}
 }
