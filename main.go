@@ -91,9 +91,6 @@ func validateConfig(cfg *ProxyConfig, lineNum int) error {
 	if cfg.Down == "" {
 		return fmt.Errorf("line %d (%s): down is required", lineNum, cfg.Name)
 	}
-	if cfg.Burst == "" {
-		cfg.Burst = "32KB"
-	}
 	return nil
 }
 
@@ -181,9 +178,27 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: download rate: %w", cfg.Name, err)
 	}
-	burst, err := parseRate(cfg.Burst)
-	if err != nil {
-		return nil, fmt.Errorf("%s: burst: %w", cfg.Name, err)
+
+	// Default burst: 1 second worth of data, but capped between 4KB and 64KB.
+	// Small burst -> tighter rate enforcement, larger burst -> more forgiving
+	// for bursty traffic.
+	var burst int
+	if cfg.Burst == "" {
+		burst = downloadRate
+		if uploadRate > burst {
+			burst = uploadRate
+		}
+		if burst < 4*1024 {
+			burst = 4 * 1024
+		}
+		if burst > 64*1024 {
+			burst = 64 * 1024
+		}
+	} else {
+		burst, err = parseRate(cfg.Burst)
+		if err != nil {
+			return nil, fmt.Errorf("%s: burst: %w", cfg.Name, err)
+		}
 	}
 
 	return &Proxy{
@@ -239,12 +254,39 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 
 	clientAddr := clientConn.RemoteAddr().String()
 
+	// Compute a tight socket buffer size so TCP backpressure kicks in quickly.
+	// Too big: kernel buffers megabytes before the sender slows down
+	//          (real bandwidth usage exceeds the configured limit).
+	// Too small: TCP can't keep pipeline full, throughput drops below the limit.
+	// Target: ~2 seconds of rate, clamped between 8KB and 128KB.
+	sockBuf := p.downloadRate * 2
+	if p.uploadRate*2 > sockBuf {
+		sockBuf = p.uploadRate * 2
+	}
+	if sockBuf < 8*1024 {
+		sockBuf = 8 * 1024
+	}
+	if sockBuf > 128*1024 {
+		sockBuf = 128 * 1024
+	}
+
+	if tc, ok := clientConn.(*net.TCPConn); ok {
+		_ = tc.SetReadBuffer(sockBuf)
+		_ = tc.SetWriteBuffer(sockBuf)
+	}
+
 	targetConn, err := net.DialTimeout("tcp", p.targetAddr, 10*time.Second)
 	if err != nil {
 		log.Printf("[%s] dial %s: %v", p.name, p.targetAddr, err)
 		return
 	}
 	defer targetConn.Close()
+
+	// Same for the upstream socket - the real backpressure win.
+	if tc, ok := targetConn.(*net.TCPConn); ok {
+		_ = tc.SetReadBuffer(sockBuf)
+		_ = tc.SetWriteBuffer(sockBuf)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
