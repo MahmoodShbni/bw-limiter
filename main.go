@@ -13,8 +13,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"golang.org/x/time/rate"
 )
 
@@ -122,6 +124,23 @@ func getOrCreateStats(name string) *ProxyStats {
 	return s
 }
 
+// setSmallSocketBuf forces a small SO_RCVBUF/SO_SNDBUF on a raw fd,
+// bypassing Go's net package which sometimes is overridden by auto-tuning.
+// Using SO_RCVBUFFORCE requires CAP_NET_ADMIN (root) and bypasses rmem_max.
+func setSmallSocketBuf(c syscall.RawConn, size int) error {
+	return c.Control(func(fd uintptr) {
+		// Try FORCE variants first (need root), fall back to normal.
+		if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, size); err != nil {
+			_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, size)
+		}
+		if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUFFORCE, size); err != nil {
+			_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, size)
+		}
+		// Disable Nagle so small chunks are sent immediately (we already pace).
+		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	})
+}
+
 // ============================================================
 // Rate Limited Reader
 // ============================================================
@@ -215,18 +234,24 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 }
 
 func (p *Proxy) Start(ctx context.Context) error {
-	lc := net.ListenConfig{}
+	sockBuf := p.socketBufferSize()
+
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			// Set options on the listener fd; accepted connections inherit them.
+			return setSmallSocketBuf(c, sockBuf)
+		},
+	}
 	listener, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", p.listenPort))
 	if err != nil {
 		return fmt.Errorf("[%s] listen :%d: %w", p.name, p.listenPort, err)
 	}
 	defer listener.Close()
 
-	log.Printf("[%s] listening on :%d -> %s (up: %s/s, down: %s/s)",
+	log.Printf("[%s] listening on :%d -> %s (up: %s/s, down: %s/s, sockbuf: %s)",
 		p.name, p.listenPort, p.targetAddr,
-		humanizeBytes(p.uploadRate), humanizeBytes(p.downloadRate))
+		humanizeBytes(p.uploadRate), humanizeBytes(p.downloadRate), humanizeBytes(sockBuf))
 
-	// Close listener when context is done.
 	go func() {
 		<-ctx.Done()
 		listener.Close()
@@ -241,51 +266,63 @@ func (p *Proxy) Start(ctx context.Context) error {
 			log.Printf("[%s] accept error: %v", p.name, err)
 			continue
 		}
-		go p.handleConnection(clientConn)
+		go p.handleConnection(clientConn, sockBuf)
 	}
 }
 
-func (p *Proxy) handleConnection(clientConn net.Conn) {
+// socketBufferSize picks a buffer size tight enough that TCP backpressure
+// kicks in quickly once the rate limiter stops draining the socket.
+// Roughly 1 second of data, clamped to a sane range.
+func (p *Proxy) socketBufferSize() int {
+	s := p.downloadRate
+	if p.uploadRate > s {
+		s = p.uploadRate
+	}
+	if s < 8*1024 {
+		s = 8 * 1024
+	}
+	if s > 64*1024 {
+		s = 64 * 1024
+	}
+	return s
+}
+
+func (p *Proxy) handleConnection(clientConn net.Conn, sockBuf int) {
 	defer clientConn.Close()
 
 	atomic.AddInt64(&p.stats.Connections, 1)
 	atomic.AddUint64(&p.stats.TotalConns, 1)
 	defer atomic.AddInt64(&p.stats.Connections, -1)
 
-	clientAddr := clientConn.RemoteAddr().String()
-
-	// Compute a tight socket buffer size so TCP backpressure kicks in quickly.
-	// Too big: kernel buffers megabytes before the sender slows down
-	//          (real bandwidth usage exceeds the configured limit).
-	// Too small: TCP can't keep pipeline full, throughput drops below the limit.
-	// Target: ~2 seconds of rate, clamped between 8KB and 128KB.
-	sockBuf := p.downloadRate * 2
-	if p.uploadRate*2 > sockBuf {
-		sockBuf = p.uploadRate * 2
-	}
-	if sockBuf < 8*1024 {
-		sockBuf = 8 * 1024
-	}
-	if sockBuf > 128*1024 {
-		sockBuf = 128 * 1024
+	// Re-apply buffer on the accepted socket (inheritance from the listener
+	// should already cover this, but SO_RCVBUFFORCE needs a second go sometimes
+	// on auto-tuned TCP sockets).
+	if rc, err := clientConn.(interface {
+		SyscallConn() (syscall.RawConn, error)
+	}).SyscallConn(); err == nil {
+		_ = setSmallSocketBuf(rc, sockBuf)
 	}
 
-	if tc, ok := clientConn.(*net.TCPConn); ok {
-		_ = tc.SetReadBuffer(sockBuf)
-		_ = tc.SetWriteBuffer(sockBuf)
+	// Dial target with a Control func so the buffer is set BEFORE connect,
+	// preventing the kernel/backend from bursting data into a default-sized buffer.
+	dialer := &net.Dialer{
+		Timeout: 10 * time.Second,
+		Control: func(network, address string, c syscall.RawConn) error {
+			return setSmallSocketBuf(c, sockBuf)
+		},
 	}
-
-	targetConn, err := net.DialTimeout("tcp", p.targetAddr, 10*time.Second)
+	targetConn, err := dialer.Dial("tcp", p.targetAddr)
 	if err != nil {
 		log.Printf("[%s] dial %s: %v", p.name, p.targetAddr, err)
 		return
 	}
 	defer targetConn.Close()
 
-	// Same for the upstream socket - the real backpressure win.
-	if tc, ok := targetConn.(*net.TCPConn); ok {
-		_ = tc.SetReadBuffer(sockBuf)
-		_ = tc.SetWriteBuffer(sockBuf)
+	// Re-apply after connect too, just to be safe.
+	if rc, err := targetConn.(interface {
+		SyscallConn() (syscall.RawConn, error)
+	}).SyscallConn(); err == nil {
+		_ = setSmallSocketBuf(rc, sockBuf)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -304,7 +341,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		}()
 		limited := &rateLimitedReader{
 			r:       clientConn,
-			limiter: p.uploadLimiter, // shared across all connections
+			limiter: p.uploadLimiter,
 			counter: &p.stats.UploadBytes,
 			ctx:     ctx,
 		}
@@ -321,7 +358,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		}()
 		limited := &rateLimitedReader{
 			r:       targetConn,
-			limiter: p.downloadLimiter, // shared across all connections
+			limiter: p.downloadLimiter,
 			counter: &p.stats.DownloadBytes,
 			ctx:     ctx,
 		}
@@ -329,7 +366,6 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	}()
 
 	wg.Wait()
-	_ = clientAddr
 }
 
 // ============================================================
