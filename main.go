@@ -164,6 +164,12 @@ type Proxy struct {
 	downloadRate int
 	burst        int
 	stats        *ProxyStats
+
+	// Shared limiters across ALL connections of this proxy.
+	// This is what makes the total rate for this proxy respect the configured limit,
+	// regardless of how many concurrent connections are open.
+	uploadLimiter   *rate.Limiter
+	downloadLimiter *rate.Limiter
 }
 
 func NewProxy(cfg ProxyConfig) (*Proxy, error) {
@@ -181,13 +187,15 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 	}
 
 	return &Proxy{
-		name:         cfg.Name,
-		listenPort:   cfg.Listen,
-		targetAddr:   cfg.Target,
-		uploadRate:   uploadRate,
-		downloadRate: downloadRate,
-		burst:        burst,
-		stats:        getOrCreateStats(cfg.Name),
+		name:            cfg.Name,
+		listenPort:      cfg.Listen,
+		targetAddr:      cfg.Target,
+		uploadRate:      uploadRate,
+		downloadRate:    downloadRate,
+		burst:           burst,
+		stats:           getOrCreateStats(cfg.Name),
+		uploadLimiter:   rate.NewLimiter(rate.Limit(uploadRate), burst),
+		downloadLimiter: rate.NewLimiter(rate.Limit(downloadRate), burst),
 	}, nil
 }
 
@@ -238,9 +246,6 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	}
 	defer targetConn.Close()
 
-	uploadLimiter := rate.NewLimiter(rate.Limit(p.uploadRate), p.burst)
-	downloadLimiter := rate.NewLimiter(rate.Limit(p.downloadRate), p.burst)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -257,7 +262,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		}()
 		limited := &rateLimitedReader{
 			r:       clientConn,
-			limiter: uploadLimiter,
+			limiter: p.uploadLimiter, // shared across all connections
 			counter: &p.stats.UploadBytes,
 			ctx:     ctx,
 		}
@@ -274,7 +279,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		}()
 		limited := &rateLimitedReader{
 			r:       targetConn,
-			limiter: downloadLimiter,
+			limiter: p.downloadLimiter, // shared across all connections
 			counter: &p.stats.DownloadBytes,
 			ctx:     ctx,
 		}
