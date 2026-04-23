@@ -1,2 +1,2 @@
-{"name": "sadegh", "listen": 9010, "target": "127.0.0.1:8010", "up": "5KB",  "down": "10KB",  "max_conns": 3, "max_conns_per_ip": 1, "new_conns_per_sec": 1, "idle_timeout_sec": 30}
-{"name": "hasaan", "listen": 9003, "target": "127.0.0.1:8003", "up": "30KB", "down": "60KB",  "max_conns": 5, "max_conns_per_ip": 2, "new_conns_per_sec": 2, "idle_timeout_sec": 60}
+{"name": "ali",  "listen": 9010, "target": "127.0.0.1:1080", "up": "30KB", "down": "300KB"}
+{"name": "ali2", "listen": 9011, "target": "127.0.0.1:1081", "up": "30KB", "down": "300KB"}

@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,16 +29,11 @@ type ProxyConfig struct {
 	Target string `json:"target"`
 	Up     string `json:"up"`
 	Down   string `json:"down"`
-	Burst  string `json:"burst,omitempty"`
-
-	// Connection limiting - this is what actually protects the backend.
-	MaxConns       int     `json:"max_conns,omitempty"`         // total concurrent conns (0 = no limit)
-	MaxConnsPerIP  int     `json:"max_conns_per_ip,omitempty"`  // per-IP concurrent conns (0 = no limit)
-	NewConnsPerSec float64 `json:"new_conns_per_sec,omitempty"` // rate of accepting new conns (0 = no limit)
-	IdleTimeoutSec int     `json:"idle_timeout_sec,omitempty"`  // close conns idle for this long (0 = disabled)
+	Burst  string `json:"burst,omitempty"` // optional, default 32KB
 }
 
 // loadConfigs reads a JSONL file (one JSON object per line).
+// Empty lines and lines starting with # are ignored.
 func loadConfigs(path string) ([]ProxyConfig, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -100,7 +96,7 @@ func validateConfig(cfg *ProxyConfig, lineNum int) error {
 }
 
 // ============================================================
-// Stats
+// Stats (global, aggregated)
 // ============================================================
 
 type ProxyStats struct {
@@ -109,7 +105,47 @@ type ProxyStats struct {
 	DownloadBytes uint64
 	Connections   int64
 	TotalConns    uint64
-	RejectedConns uint64
+
+	// Active client IPs with reference counts.
+	// Ref-counted so multiple simultaneous connections from the same IP
+	// only remove the entry once all of them close.
+	ipsMu sync.RWMutex
+	ips   map[string]int
+}
+
+func newProxyStats(name string) *ProxyStats {
+	return &ProxyStats{
+		Name: name,
+		ips:  make(map[string]int),
+	}
+}
+
+func (s *ProxyStats) addIP(ip string) {
+	s.ipsMu.Lock()
+	s.ips[ip]++
+	s.ipsMu.Unlock()
+}
+
+func (s *ProxyStats) removeIP(ip string) {
+	s.ipsMu.Lock()
+	if s.ips[ip] <= 1 {
+		delete(s.ips, ip)
+	} else {
+		s.ips[ip]--
+	}
+	s.ipsMu.Unlock()
+}
+
+// snapshotIPs returns a sorted slice of currently connected IPs.
+func (s *ProxyStats) snapshotIPs() []string {
+	s.ipsMu.RLock()
+	out := make([]string, 0, len(s.ips))
+	for ip := range s.ips {
+		out = append(out, ip)
+	}
+	s.ipsMu.RUnlock()
+	sort.Strings(out)
+	return out
 }
 
 var (
@@ -122,59 +158,27 @@ func getOrCreateStats(name string) *ProxyStats {
 	defer statsMutex.Unlock()
 	s, ok := allStats[name]
 	if !ok {
-		s = &ProxyStats{Name: name}
+		s = newProxyStats(name)
 		allStats[name] = s
 	}
 	return s
 }
 
 // ============================================================
-// Per-IP connection counter
-// ============================================================
-
-type ipCounter struct {
-	mu     sync.Mutex
-	counts map[string]int
-}
-
-func newIPCounter() *ipCounter {
-	return &ipCounter{counts: make(map[string]int)}
-}
-
-func (c *ipCounter) tryAdd(ip string, max int) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if max > 0 && c.counts[ip] >= max {
-		return false
-	}
-	c.counts[ip]++
-	return true
-}
-
-func (c *ipCounter) remove(ip string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.counts[ip] <= 1 {
-		delete(c.counts, ip)
-	} else {
-		c.counts[ip]--
-	}
-}
-
-// ============================================================
-// Rate Limited Reader with idle timeout
+// Rate Limited Reader
 // ============================================================
 
 type rateLimitedReader struct {
-	r            io.Reader
-	limiter      *rate.Limiter
-	counter      *uint64
-	lastActivity *int64 // unix nano, atomic
-	ctx          context.Context
+	r       io.Reader
+	limiter *rate.Limiter
+	counter *uint64
+	ctx     context.Context
 }
 
 func (rlr *rateLimitedReader) Read(p []byte) (int, error) {
-	// 16KB chunks - smooth for tunneled protocols, good enough for rate control.
+	// 16KB chunks: balance between rate accuracy and throughput.
+	// Tunneled protocols like vless prefer larger chunks to avoid fragmenting
+	// their inner frames, which causes serious latency and retransmit issues.
 	const maxChunk = 16 * 1024
 	if len(p) > maxChunk {
 		p = p[:maxChunk]
@@ -183,9 +187,6 @@ func (rlr *rateLimitedReader) Read(p []byte) (int, error) {
 	n, err := rlr.r.Read(p)
 	if n > 0 {
 		atomic.AddUint64(rlr.counter, uint64(n))
-		if rlr.lastActivity != nil {
-			atomic.StoreInt64(rlr.lastActivity, time.Now().UnixNano())
-		}
 		if waitErr := rlr.limiter.WaitN(rlr.ctx, n); waitErr != nil {
 			return n, waitErr
 		}
@@ -198,21 +199,17 @@ func (rlr *rateLimitedReader) Read(p []byte) (int, error) {
 // ============================================================
 
 type Proxy struct {
-	cfg          ProxyConfig
+	name         string
+	listenPort   int
+	targetAddr   string
 	uploadRate   int
 	downloadRate int
 	burst        int
 	stats        *ProxyStats
 
-	// Shared rate limiters across all connections of this proxy.
+	// Shared limiters across ALL connections of this proxy.
 	uploadLimiter   *rate.Limiter
 	downloadLimiter *rate.Limiter
-
-	// Connection limiting.
-	connSem     chan struct{}  // semaphore for max total conns
-	acceptLimit *rate.Limiter  // rate of accepting new conns
-	ipCounter   *ipCounter     // per-IP active conn counter
-	idleTimeout time.Duration
 }
 
 func NewProxy(cfg ProxyConfig) (*Proxy, error) {
@@ -247,51 +244,30 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		}
 	}
 
-	p := &Proxy{
-		cfg:             cfg,
+	return &Proxy{
+		name:            cfg.Name,
+		listenPort:      cfg.Listen,
+		targetAddr:      cfg.Target,
 		uploadRate:      uploadRate,
 		downloadRate:    downloadRate,
 		burst:           burst,
 		stats:           getOrCreateStats(cfg.Name),
 		uploadLimiter:   rate.NewLimiter(rate.Limit(uploadRate), burst),
 		downloadLimiter: rate.NewLimiter(rate.Limit(downloadRate), burst),
-		ipCounter:       newIPCounter(),
-	}
-
-	if cfg.MaxConns > 0 {
-		p.connSem = make(chan struct{}, cfg.MaxConns)
-	}
-	if cfg.NewConnsPerSec > 0 {
-		// Allow a small burst (5 connections) to absorb legitimate bursts.
-		p.acceptLimit = rate.NewLimiter(rate.Limit(cfg.NewConnsPerSec), 5)
-	}
-	if cfg.IdleTimeoutSec > 0 {
-		p.idleTimeout = time.Duration(cfg.IdleTimeoutSec) * time.Second
-	}
-
-	return p, nil
+	}, nil
 }
 
 func (p *Proxy) Start(ctx context.Context) error {
 	lc := net.ListenConfig{}
-	listener, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", p.cfg.Listen))
+	listener, err := lc.Listen(ctx, "tcp", fmt.Sprintf(":%d", p.listenPort))
 	if err != nil {
-		return fmt.Errorf("[%s] listen :%d: %w", p.cfg.Name, p.cfg.Listen, err)
+		return fmt.Errorf("[%s] listen :%d: %w", p.name, p.listenPort, err)
 	}
 	defer listener.Close()
 
-	log.Printf("[%s] listening on :%d -> %s", p.cfg.Name, p.cfg.Listen, p.cfg.Target)
-	log.Printf("[%s]   rates:  up=%s/s  down=%s/s  burst=%s",
-		p.cfg.Name,
-		humanizeBytes(p.uploadRate),
-		humanizeBytes(p.downloadRate),
-		humanizeBytes(p.burst))
-	log.Printf("[%s]   limits: max_conns=%d  per_ip=%d  new_per_sec=%g  idle=%ds",
-		p.cfg.Name,
-		p.cfg.MaxConns,
-		p.cfg.MaxConnsPerIP,
-		p.cfg.NewConnsPerSec,
-		p.cfg.IdleTimeoutSec)
+	log.Printf("[%s] listening on :%d -> %s (up: %s/s, down: %s/s, burst: %s)",
+		p.name, p.listenPort, p.targetAddr,
+		humanizeBytes(p.uploadRate), humanizeBytes(p.downloadRate), humanizeBytes(p.burst))
 
 	go func() {
 		<-ctx.Done()
@@ -304,8 +280,7 @@ func (p *Proxy) Start(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			log.Printf("[%s] accept error: %v", p.cfg.Name, err)
-			time.Sleep(100 * time.Millisecond)
+			log.Printf("[%s] accept error: %v", p.name, err)
 			continue
 		}
 		go p.handleConnection(clientConn)
@@ -315,54 +290,17 @@ func (p *Proxy) Start(ctx context.Context) error {
 func (p *Proxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	clientIP := remoteIP(clientConn)
-
-	// 1. Rate-limit acceptance of NEW connections.
-	// Prevents connection storms from slamming the backend.
-	if p.acceptLimit != nil {
-		// Reserve rather than wait - if we'd wait too long, just drop.
-		r := p.acceptLimit.Reserve()
-		if !r.OK() || r.Delay() > 2*time.Second {
-			r.Cancel()
-			rejectHard(clientConn)
-			atomic.AddUint64(&p.stats.RejectedConns, 1)
-			return
-		}
-		time.Sleep(r.Delay())
-	}
-
-	// 2. Per-IP concurrent connection limit.
-	// Blocks a single client (or IDM) from hogging all slots.
-	if p.cfg.MaxConnsPerIP > 0 {
-		if !p.ipCounter.tryAdd(clientIP, p.cfg.MaxConnsPerIP) {
-			rejectHard(clientConn)
-			atomic.AddUint64(&p.stats.RejectedConns, 1)
-			return
-		}
-		defer p.ipCounter.remove(clientIP)
-	}
-
-	// 3. Global concurrent connection limit (semaphore).
-	// Keeps total load on the backend bounded - this is the key knob.
-	if p.connSem != nil {
-		select {
-		case p.connSem <- struct{}{}:
-			defer func() { <-p.connSem }()
-		default:
-			rejectHard(clientConn)
-			atomic.AddUint64(&p.stats.RejectedConns, 1)
-			return
-		}
-	}
+	ip := remoteIP(clientConn)
+	p.stats.addIP(ip)
+	defer p.stats.removeIP(ip)
 
 	atomic.AddInt64(&p.stats.Connections, 1)
 	atomic.AddUint64(&p.stats.TotalConns, 1)
 	defer atomic.AddInt64(&p.stats.Connections, -1)
 
-	// Dial the target.
-	targetConn, err := net.DialTimeout("tcp", p.cfg.Target, 10*time.Second)
+	targetConn, err := net.DialTimeout("tcp", p.targetAddr, 10*time.Second)
 	if err != nil {
-		log.Printf("[%s] dial %s: %v", p.cfg.Name, p.cfg.Target, err)
+		log.Printf("[%s] dial %s: %v", p.name, p.targetAddr, err)
 		return
 	}
 	defer targetConn.Close()
@@ -370,18 +308,10 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Idle timeout tracking.
-	var lastActivity int64
-	atomic.StoreInt64(&lastActivity, time.Now().UnixNano())
-
-	if p.idleTimeout > 0 {
-		go p.watchIdle(ctx, cancel, &lastActivity, clientConn, targetConn)
-	}
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// client -> target (upload)
+	// client -> server (upload)
 	go func() {
 		defer wg.Done()
 		defer func() {
@@ -390,16 +320,15 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 			}
 		}()
 		limited := &rateLimitedReader{
-			r:            clientConn,
-			limiter:      p.uploadLimiter,
-			counter:      &p.stats.UploadBytes,
-			lastActivity: &lastActivity,
-			ctx:          ctx,
+			r:       clientConn,
+			limiter: p.uploadLimiter,
+			counter: &p.stats.UploadBytes,
+			ctx:     ctx,
 		}
 		io.Copy(targetConn, limited)
 	}()
 
-	// target -> client (download)
+	// server -> client (download)
 	go func() {
 		defer wg.Done()
 		defer func() {
@@ -408,11 +337,10 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 			}
 		}()
 		limited := &rateLimitedReader{
-			r:            targetConn,
-			limiter:      p.downloadLimiter,
-			counter:      &p.stats.DownloadBytes,
-			lastActivity: &lastActivity,
-			ctx:          ctx,
+			r:       targetConn,
+			limiter: p.downloadLimiter,
+			counter: &p.stats.DownloadBytes,
+			ctx:     ctx,
 		}
 		io.Copy(clientConn, limited)
 	}()
@@ -420,27 +348,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	wg.Wait()
 }
 
-// watchIdle closes the connection if it has been idle for too long.
-func (p *Proxy) watchIdle(ctx context.Context, cancel context.CancelFunc, lastActivity *int64, c1, c2 net.Conn) {
-	ticker := time.NewTicker(p.idleTimeout / 2)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			last := time.Unix(0, atomic.LoadInt64(lastActivity))
-			if time.Since(last) > p.idleTimeout {
-				c1.Close()
-				c2.Close()
-				cancel()
-				return
-			}
-		}
-	}
-}
-
+// remoteIP returns the IP portion of a connection's remote address.
 func remoteIP(c net.Conn) string {
 	addr := c.RemoteAddr().String()
 	host, _, err := net.SplitHostPort(addr)
@@ -448,16 +356,6 @@ func remoteIP(c net.Conn) string {
 		return addr
 	}
 	return host
-}
-
-// rejectHard closes a connection with RST instead of FIN, so the client's
-// socket goes away immediately without lingering in TIME_WAIT on our side.
-// Critical when rejecting connection storms - otherwise we accumulate
-// thousands of TIME_WAIT sockets and exhaust ephemeral ports.
-func rejectHard(c net.Conn) {
-	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.SetLinger(0) // 0 = RST on close, no TIME_WAIT
-	}
 }
 
 // ============================================================
@@ -496,18 +394,24 @@ func printStats(interval time.Duration) {
 			down := atomic.LoadUint64(&s.DownloadBytes)
 			conns := atomic.LoadInt64(&s.Connections)
 			total := atomic.LoadUint64(&s.TotalConns)
-			rejected := atomic.LoadUint64(&s.RejectedConns)
+			ips := s.snapshotIPs()
 
 			prev := last[name]
 			upRate := float64(up-prev.upload) / elapsed
 			downRate := float64(down-prev.download) / elapsed
 
-			log.Printf("[%s] active:%d total:%d rejected:%d | up:%s/s down:%s/s | totals: up=%s down=%s",
-				name, conns, total, rejected,
+			ipsStr := "-"
+			if len(ips) > 0 {
+				ipsStr = strings.Join(ips, ", ")
+			}
+
+			log.Printf("[%s] conns: %d/%d | up: %s/s | down: %s/s | total: up=%s down=%s | Connected ips: %s",
+				name, conns, total,
 				humanizeBytes(int(upRate)),
 				humanizeBytes(int(downRate)),
 				humanizeBytes(int(up)),
 				humanizeBytes(int(down)),
+				ipsStr,
 			)
 
 			last[name] = snapshot{upload: up, download: down}
@@ -596,7 +500,7 @@ func main() {
 		go func(proxy *Proxy) {
 			defer wg.Done()
 			if err := proxy.Start(ctx); err != nil {
-				log.Printf("[%s] stopped: %v", proxy.cfg.Name, err)
+				log.Printf("[%s] stopped: %v", proxy.name, err)
 			}
 		}(p)
 	}

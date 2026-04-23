@@ -1,8 +1,16 @@
 # bwlimit
 
-TCP proxy with per-proxy bandwidth limits AND connection limits. Multi-proxy from a single JSON config.
+A simple TCP proxy that enforces real bandwidth limits on a per-connection basis.
 
-The point is **protecting the backend**. Rate limiting alone doesn't help when 500 connections pile up and swamp the target. This tool also caps concurrent connections, per-IP connections, and the rate of accepting new connections.
+Unlike `tc`, which relies on kernel queueing and TCP's own reaction to congestion, this proxy controls throughput in the application layer with a token bucket — giving you precise, predictable limits.
+
+## Features
+
+- Per-connection upload and download limits
+- Independent rate limits per direction
+- Live stats every 5 seconds
+- Human-friendly units (KB, MB)
+- Single static binary, no dependencies at runtime
 
 ## Build
 
@@ -11,73 +19,49 @@ go mod tidy
 go build -o bwlimit main.go
 ```
 
-## Config format
-
-`config.json` is JSONL — one JSON object per line.
-
-```json
-{"name": "sadegh", "listen": 9010, "target": "127.0.0.1:8010", "up": "5KB", "down": "10KB", "max_conns": 3, "max_conns_per_ip": 1, "new_conns_per_sec": 1, "idle_timeout_sec": 30}
-```
-
-### Fields
-
-| Field | Required | Description |
-|---|---|---|
-| `name` | no | Label in logs (default: `proxy-<port>`) |
-| `listen` | yes | Local listen port |
-| `target` | yes | Backend address `host:port` |
-| `up` | yes | Upload rate limit (client → target), e.g. `30KB`, `1MB` |
-| `down` | yes | Download rate limit (target → client), e.g. `300KB`, `2MB` |
-| `burst` | no | Token bucket burst (default: rate-based, min 64KB) |
-| `max_conns` | no | Max concurrent connections total (0 = no limit) |
-| `max_conns_per_ip` | no | Max concurrent connections per client IP (0 = no limit) |
-| `new_conns_per_sec` | no | Max rate of accepting new connections (0 = no limit) |
-| `idle_timeout_sec` | no | Kill connection after N seconds of no traffic (0 = disabled) |
-
-## Why connection limits matter
-
-A single client using IDM or a download accelerator can open 30+ parallel connections. If your rate limit is 100KB/s per connection, that's 3MB/s total from one user. Worse — each connection makes the backend (vless, shadowsocks, etc.) open its own upstream connection, multiplying load.
-
-**Recommended starting point for most cases:**
-
-```json
-{"max_conns": 10, "max_conns_per_ip": 2, "new_conns_per_sec": 5, "idle_timeout_sec": 60}
-```
-
-- Caps total load on backend at 10 simultaneous streams
-- One user can't monopolize with more than 2 connections
-- Connection storms are smoothed out to 5/sec (with a small burst)
-- Dead connections are reaped after a minute
-
-When limits are hit, new connections are **rejected immediately** (not queued) — the client just sees a connection refused and will retry. This is better than queueing which can cause timeouts.
+Or grab a prebuilt binary from the Releases page.
 
 ## Usage
 
 ```bash
-./bwlimit -config config.json
+./bwlimit -listen 8080 -target 127.0.0.1:80 -up 30KB -down 300KB
 ```
 
-Flags:
+Now any client connecting to port 8080 will be forwarded to `127.0.0.1:80` with a 30KB/s upload cap and 300KB/s download cap.
+
+## Flags
 
 | Flag | Description | Default |
 |---|---|---|
-| `-config` | Path to JSONL config | `config.json` |
-| `-stats-interval` | How often to print stats | `5s` |
+| `-listen` | Local port to listen on | `8080` |
+| `-target` | Target address `host:port` | `127.0.0.1:80` |
+| `-up` | Upload rate limit (client → server) | `30KB` |
+| `-down` | Download rate limit (server → client) | `300KB` |
+| `-burst` | Token bucket burst size (KB) | `32` |
 
-## Example log output
+## Examples
 
+**Limit a local web server:**
+```bash
+./bwlimit -listen 8080 -target 127.0.0.1:80 -up 100KB -down 500KB
 ```
-loaded 2 proxy entries from config.json
-[sadegh] listening on :9010 -> 127.0.0.1:8010
-[sadegh]   rates:  up=5.00 KB/s  down=10.00 KB/s  burst=64.00 KB
-[sadegh]   limits: max_conns=3  per_ip=1  new_per_sec=1  idle=30s
------- stats ------
-[sadegh] active:3 total:47 rejected:212 | up:4.80 KB/s down:9.92 KB/s | totals: up=142.00 KB down=284.00 KB
+
+**Limit multiple ports (run multiple instances):**
+```bash
+./bwlimit -listen 8080 -target 127.0.0.1:80 -up 30KB -down 300KB &
+./bwlimit -listen 8443 -target 127.0.0.1:443 -up 30KB -down 300KB &
 ```
 
-The `rejected` counter tells you whether your limits are being hit. If rejected grows fast, consider raising `max_conns` or `new_conns_per_sec`.
+**Transparent redirect with iptables:**
+```bash
+# Move real service to port 8000, run bwlimit on 8080, redirect 80 → 8080
+./bwlimit -listen 8080 -target 127.0.0.1:8000 -up 30KB -down 300KB &
+sudo iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8080
+```
 
 ## Systemd service
+
+`/etc/systemd/system/bwlimit.service`:
 
 ```ini
 [Unit]
@@ -86,10 +70,17 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/bwlimit -config /etc/bwlimit/config.json
+ExecStart=/usr/local/bin/bwlimit -listen 8080 -target 127.0.0.1:80 -up 30KB -down 300KB
 Restart=always
 User=root
 
 [Install]
 WantedBy=multi-user.target
+```
+
+```bash
+sudo cp bwlimit /usr/local/bin/
+sudo systemctl daemon-reload
+sudo systemctl enable --now bwlimit
+sudo journalctl -u bwlimit -f
 ```
