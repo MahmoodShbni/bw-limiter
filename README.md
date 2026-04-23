@@ -1,22 +1,8 @@
 # bwlimit
 
-A simple TCP proxy that enforces real bandwidth limits AND protects the backend from connection-abuse tools like IDM (Internet Download Manager), FDM, aria2, etc.
+TCP proxy with per-proxy bandwidth limits AND connection limits. Multi-proxy from a single JSON config.
 
-## Why this exists
-
-- **`tc` can't fix this problem.** Kernel-level shaping doesn't know about connection counts, it only shapes packets.
-- **IDM and similar tools open 8-32 parallel connections per file.** With 5 simultaneous downloads, that's 40-160 concurrent TCP connections — enough to overwhelm a vless/xray backend's CPU and crash it.
-- **This proxy throttles both bandwidth AND connection count**, so the backend stays healthy.
-
-## Features
-
-- Per-proxy upload and download rate limits
-- **Max concurrent connections per proxy**
-- **Max concurrent connections per client IP** (this is the big one for IDM)
-- **Rate limit for new connections per second** (prevents connection floods)
-- **Idle connection timeout** (cleans up half-dead connections)
-- Live stats every 5 seconds
-- Single binary, no runtime dependencies
+The point is **protecting the backend**. Rate limiting alone doesn't help when 500 connections pile up and swamp the target. This tool also caps concurrent connections, per-IP connections, and the rate of accepting new connections.
 
 ## Build
 
@@ -27,49 +13,43 @@ go build -o bwlimit main.go
 
 ## Config format
 
-One JSON object per line (`config.json`):
+`config.json` is JSONL — one JSON object per line.
 
 ```json
-{"name": "ali", "listen": 9010, "target": "127.0.0.1:1080", "up": "30KB", "down": "300KB", "max_conns": 30, "max_conns_per_ip": 6, "new_conns_per_sec": 5, "idle_timeout_sec": 60}
+{"name": "sadegh", "listen": 9010, "target": "127.0.0.1:8010", "up": "5KB", "down": "10KB", "max_conns": 3, "max_conns_per_ip": 1, "new_conns_per_sec": 1, "idle_timeout_sec": 30}
 ```
 
 ### Fields
 
 | Field | Required | Description |
 |---|---|---|
-| `name` | no | Label for logs (default: `proxy-<port>`) |
-| `listen` | yes | Local port to listen on |
-| `target` | yes | Target address `host:port` |
-| `up` | yes | Upload rate limit (client → server), e.g. `30KB`, `1MB` |
-| `down` | yes | Download rate limit (server → client), e.g. `300KB`, `2MB` |
-| `burst` | no | Token bucket burst size (auto-computed if omitted) |
-| `max_conns` | no | Max total concurrent connections (0 = unlimited) |
-| `max_conns_per_ip` | no | Max concurrent connections per client IP (0 = unlimited) |
-| `new_conns_per_sec` | no | Max new connections accepted per second (0 = unlimited) |
-| `idle_timeout_sec` | no | Close connections with no traffic for this long (0 = disabled) |
+| `name` | no | Label in logs (default: `proxy-<port>`) |
+| `listen` | yes | Local listen port |
+| `target` | yes | Backend address `host:port` |
+| `up` | yes | Upload rate limit (client → target), e.g. `30KB`, `1MB` |
+| `down` | yes | Download rate limit (target → client), e.g. `300KB`, `2MB` |
+| `burst` | no | Token bucket burst (default: rate-based, min 64KB) |
+| `max_conns` | no | Max concurrent connections total (0 = no limit) |
+| `max_conns_per_ip` | no | Max concurrent connections per client IP (0 = no limit) |
+| `new_conns_per_sec` | no | Max rate of accepting new connections (0 = no limit) |
+| `idle_timeout_sec` | no | Kill connection after N seconds of no traffic (0 = disabled) |
 
-## Recommended settings for a vless/xray backend
+## Why connection limits matter
 
-Preventing IDM abuse:
+A single client using IDM or a download accelerator can open 30+ parallel connections. If your rate limit is 100KB/s per connection, that's 3MB/s total from one user. Worse — each connection makes the backend (vless, shadowsocks, etc.) open its own upstream connection, multiplying load.
+
+**Recommended starting point for most cases:**
 
 ```json
-{
-  "name": "user1",
-  "listen": 9010,
-  "target": "127.0.0.1:1080",
-  "up": "30KB",
-  "down": "300KB",
-  "max_conns_per_ip": 6,
-  "new_conns_per_sec": 5,
-  "idle_timeout_sec": 60
-}
+{"max_conns": 10, "max_conns_per_ip": 2, "new_conns_per_sec": 5, "idle_timeout_sec": 60}
 ```
 
-**Why these numbers:**
+- Caps total load on backend at 10 simultaneous streams
+- One user can't monopolize with more than 2 connections
+- Connection storms are smoothed out to 5/sec (with a small burst)
+- Dead connections are reaped after a minute
 
-- `max_conns_per_ip: 6` — normal browsers open 6-8 connections per host. IDM wants 8-32. Set to 6 to allow normal browsing but block accelerators.
-- `new_conns_per_sec: 5` — prevents a flood of 100 new connections in 1 second (typical IDM burst).
-- `idle_timeout_sec: 60` — frees slots from dead connections that clients forgot to close.
+When limits are hit, new connections are **rejected immediately** (not queued) — the client just sees a connection refused and will retry. This is better than queueing which can cause timeouts.
 
 ## Usage
 
@@ -77,17 +57,27 @@ Preventing IDM abuse:
 ./bwlimit -config config.json
 ```
 
-## Example stats output
+Flags:
+
+| Flag | Description | Default |
+|---|---|---|
+| `-config` | Path to JSONL config | `config.json` |
+| `-stats-interval` | How often to print stats | `5s` |
+
+## Example log output
 
 ```
-[ali] conns: 12/245 (rejected: 38) | up: 28.50 KB/s | down: 295.20 KB/s | total: up=142.00 KB down=1.45 MB
+loaded 2 proxy entries from config.json
+[sadegh] listening on :9010 -> 127.0.0.1:8010
+[sadegh]   rates:  up=5.00 KB/s  down=10.00 KB/s  burst=64.00 KB
+[sadegh]   limits: max_conns=3  per_ip=1  new_per_sec=1  idle=30s
+------ stats ------
+[sadegh] active:3 total:47 rejected:212 | up:4.80 KB/s down:9.92 KB/s | totals: up=142.00 KB down=284.00 KB
 ```
 
-`rejected: 38` shows how many connections were dropped due to limits — that's IDM being stopped.
+The `rejected` counter tells you whether your limits are being hit. If rejected grows fast, consider raising `max_conns` or `new_conns_per_sec`.
 
 ## Systemd service
-
-`/etc/systemd/system/bwlimit.service`:
 
 ```ini
 [Unit]
@@ -102,13 +92,4 @@ User=root
 
 [Install]
 WantedBy=multi-user.target
-```
-
-```bash
-sudo mkdir -p /etc/bwlimit
-sudo cp config.json /etc/bwlimit/
-sudo cp bwlimit /usr/local/bin/
-sudo systemctl daemon-reload
-sudo systemctl enable --now bwlimit
-sudo journalctl -u bwlimit -f
 ```
