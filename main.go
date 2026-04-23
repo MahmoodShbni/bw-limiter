@@ -324,6 +324,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		r := p.acceptLimit.Reserve()
 		if !r.OK() || r.Delay() > 2*time.Second {
 			r.Cancel()
+			rejectHard(clientConn)
 			atomic.AddUint64(&p.stats.RejectedConns, 1)
 			return
 		}
@@ -334,6 +335,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	// Blocks a single client (or IDM) from hogging all slots.
 	if p.cfg.MaxConnsPerIP > 0 {
 		if !p.ipCounter.tryAdd(clientIP, p.cfg.MaxConnsPerIP) {
+			rejectHard(clientConn)
 			atomic.AddUint64(&p.stats.RejectedConns, 1)
 			return
 		}
@@ -347,6 +349,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		case p.connSem <- struct{}{}:
 			defer func() { <-p.connSem }()
 		default:
+			rejectHard(clientConn)
 			atomic.AddUint64(&p.stats.RejectedConns, 1)
 			return
 		}
@@ -445,6 +448,16 @@ func remoteIP(c net.Conn) string {
 		return addr
 	}
 	return host
+}
+
+// rejectHard closes a connection with RST instead of FIN, so the client's
+// socket goes away immediately without lingering in TIME_WAIT on our side.
+// Critical when rejecting connection storms - otherwise we accumulate
+// thousands of TIME_WAIT sockets and exhaust ephemeral ports.
+func rejectHard(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetLinger(0) // 0 = RST on close, no TIME_WAIT
+	}
 }
 
 // ============================================================
