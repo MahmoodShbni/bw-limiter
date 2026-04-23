@@ -1,6 +1,2 @@
-// max_conns: total concurrent connections for this proxy (0 = unlimited)
-// max_conns_per_ip: concurrent connections per client IP (0 = unlimited) - BLOCKS IDM!
-// new_conns_per_sec: rate limit for new connections (0 = unlimited)
-// idle_timeout_sec: close connections with no traffic for this long (0 = disabled)
-{"name": "ali",  "listen": 9010, "target": "127.0.0.1:1080", "up": "30KB", "down": "300KB", "max_conns": 30, "max_conns_per_ip": 6, "new_conns_per_sec": 5, "idle_timeout_sec": 60}
-{"name": "ali2", "listen": 9011, "target": "127.0.0.1:1081", "up": "30KB", "down": "300KB", "max_conns": 30, "max_conns_per_ip": 6, "new_conns_per_sec": 5, "idle_timeout_sec": 60}
+{"name": "sadegh", "listen": 9010, "target": "127.0.0.1:8010", "up": "5KB",  "down": "10KB",  "max_conns": 3, "max_conns_per_ip": 1, "new_conns_per_sec": 1, "idle_timeout_sec": 30}
+{"name": "hasaan", "listen": 9003, "target": "127.0.0.1:8003", "up": "30KB", "down": "60KB",  "max_conns": 5, "max_conns_per_ip": 2, "new_conns_per_sec": 2, "idle_timeout_sec": 60}
